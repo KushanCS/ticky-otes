@@ -1,21 +1,28 @@
 (() => {
   const STORAGE_KEY = "ai_branch_cards";
-  const API_URL = "http://127.0.0.1:5000/chat";
+  const CHAT_API_URL = "http://127.0.0.1:5000/chat";
+  const SUMMARY_API_URL = "http://127.0.0.1:5000/summarize-card-context";
 
   let explainButton = null;
   let sidebar = null;
   let cardsContainer = null;
+
+  function isExtensionContextValid() {
+    return !!(globalThis.chrome && chrome.runtime && chrome.runtime.id);
+  }
 
   function generateId() {
     return `card_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
   }
 
   async function getStoredCards() {
+    if (!isExtensionContextValid()) return [];
     const result = await chrome.storage.local.get([STORAGE_KEY]);
     return result[STORAGE_KEY] || [];
   }
 
   async function saveStoredCards(cards) {
+    if (!isExtensionContextValid()) return;
     await chrome.storage.local.set({ [STORAGE_KEY]: cards });
   }
 
@@ -56,6 +63,11 @@
     const selection = window.getSelection();
     if (!selection) return "";
     return selection.toString().trim();
+  }
+
+  function extractParentContext() {
+    const text = document.body.innerText || "";
+    return text.slice(-4000);
   }
 
   function ensureSidebar() {
@@ -117,7 +129,6 @@
     header.appendChild(closeBtn);
 
     cardsContainer = document.createElement("div");
-    cardsContainer.id = "ai-branch-cards";
     Object.assign(cardsContainer.style, {
       flex: "1",
       overflowY: "auto",
@@ -183,18 +194,40 @@
     return wrapper;
   }
 
-  async function askGemini(card) {
-  const messages = card.messages || [];
-  const lastUserMessage = [...messages].reverse().find((m) => m.role === "user");
+  async function summarizeCardContext(selectedText, parentContext) {
+    const response = await fetch(SUMMARY_API_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        selectedText,
+        parentContext
+      })
+    });
 
-  try {
-    const response = await fetch(API_URL, {
+    const data = await response.json();
+
+    if (!response.ok) {
+      throw new Error(typeof data.error === "string" ? data.error : JSON.stringify(data.error));
+    }
+
+    return data;
+  }
+
+  async function askGemini(card) {
+    const messages = card.messages || [];
+    const lastUserMessage = [...messages].reverse().find((m) => m.role === "user");
+
+    const response = await fetch(CHAT_API_URL, {
       method: "POST",
       headers: {
         "Content-Type": "application/json"
       },
       body: JSON.stringify({
         selectedText: card.selectedText,
+        parentSummary: card.parentSummary || "",
+        keyPoints: card.keyPoints || [],
         messages,
         question: lastUserMessage ? lastUserMessage.content : ""
       })
@@ -203,27 +236,23 @@
     const data = await response.json();
 
     if (!response.ok) {
-      throw new Error(
-        typeof data.error === "string" ? data.error : JSON.stringify(data.error)
-      );
+      throw new Error(typeof data.error === "string" ? data.error : JSON.stringify(data.error));
     }
 
     return data.answer;
-  } catch (error) {
-    console.error("Fetch error details:", error);
-    throw new Error("Could not connect to backend. Make sure Flask server is running.");
-  }
-}
-
-  async function refreshCardMessages(cardId, messagesContainer) {
-    const updatedCard = await getCardById(cardId);
-    messagesContainer.innerHTML = "";
-    messagesContainer.appendChild(buildMessagesList(updatedCard.messages || []));
   }
 
-  async function handleSendMessage(cardId, input, messagesContainer, sendBtn) {
+  async function refreshCard(cardId, cardElement) {
+    const cardData = await getCardById(cardId);
+    if (!cardData || !cardElement) return;
+
+    const newCard = createCardElement(cardData);
+    cardElement.replaceWith(newCard);
+  }
+
+  async function handleSendMessage(cardId, input, sendBtn, cardElement) {
     const text = input.value.trim();
-    if (!text) return;
+    if (!text || sendBtn.disabled) return;
 
     input.value = "";
     input.disabled = true;
@@ -238,47 +267,62 @@
           role: "user",
           content: text,
           timestamp: Date.now()
+        },
+        {
+          role: "assistant",
+          content: "Thinking...",
+          timestamp: Date.now(),
+          pending: true
         }
       ]
     }));
 
-    await refreshCardMessages(cardId, messagesContainer);
+    await refreshCard(cardId, cardElement);
 
     try {
       const card = await getCardById(cardId);
       const aiAnswer = await askGemini(card);
 
-      await updateCardInStorage(cardId, (storedCard) => ({
-        ...storedCard,
-        messages: [
-          ...(storedCard.messages || []),
-          {
+      await updateCardInStorage(cardId, (storedCard) => {
+        const updatedMessages = [...(storedCard.messages || [])];
+        const lastIndex = updatedMessages.findLastIndex((m) => m.pending);
+
+        if (lastIndex !== -1) {
+          updatedMessages[lastIndex] = {
             role: "assistant",
             content: aiAnswer,
             timestamp: Date.now()
-          }
-        ]
-      }));
+          };
+        }
 
-      await refreshCardMessages(cardId, messagesContainer);
+        return {
+          ...storedCard,
+          messages: updatedMessages
+        };
+      });
     } catch (error) {
-      await updateCardInStorage(cardId, (storedCard) => ({
-        ...storedCard,
-        messages: [
-          ...(storedCard.messages || []),
-          {
+      await updateCardInStorage(cardId, (storedCard) => {
+        const updatedMessages = [...(storedCard.messages || [])];
+        const lastIndex = updatedMessages.findLastIndex((m) => m.pending);
+
+        if (lastIndex !== -1) {
+          updatedMessages[lastIndex] = {
             role: "assistant",
             content: `Error: ${error.message}`,
             timestamp: Date.now()
-          }
-        ]
-      }));
+          };
+        }
 
-      await refreshCardMessages(cardId, messagesContainer);
-    } finally {
-      input.disabled = false;
-      sendBtn.disabled = false;
-      sendBtn.textContent = "Send";
+        return {
+          ...storedCard,
+          messages: updatedMessages
+        };
+      });
+    }
+
+    const updatedCardElement = document.querySelector(`[data-card-id="${cardId}"]`);
+    if (updatedCardElement) {
+      await refreshCard(cardId, updatedCardElement);
     }
   }
 
@@ -307,7 +351,7 @@
     });
 
     const cardTitle = document.createElement("div");
-    cardTitle.textContent = cardData.title || "New Card";
+    cardTitle.textContent = cardData.title || "Building context...";
     Object.assign(cardTitle.style, {
       fontSize: "14px",
       fontWeight: "600",
@@ -358,10 +402,9 @@
       wordBreak: "break-word"
     });
 
-    const introMessage = document.createElement("div");
-    introMessage.textContent =
-      cardData.message || "Branch card ready. Ask a follow-up question.";
-    Object.assign(introMessage.style, {
+    const summaryBox = document.createElement("div");
+    summaryBox.textContent = cardData.parentSummary || "Building branch context...";
+    Object.assign(summaryBox.style, {
       fontSize: "13px",
       lineHeight: "1.5",
       color: "#374151",
@@ -370,6 +413,41 @@
       borderRadius: "10px",
       padding: "10px"
     });
+
+    card.appendChild(cardHeader);
+    card.appendChild(label);
+    card.appendChild(selectedTextBox);
+    card.appendChild(summaryBox);
+
+    if (cardData.keyPoints && cardData.keyPoints.length) {
+      const keyPointsTitle = document.createElement("div");
+      keyPointsTitle.textContent = "Important points";
+      Object.assign(keyPointsTitle.style, {
+        fontSize: "12px",
+        fontWeight: "600",
+        color: "#6b7280",
+        textTransform: "uppercase",
+        letterSpacing: "0.04em"
+      });
+
+      const keyPointsList = document.createElement("ul");
+      Object.assign(keyPointsList.style, {
+        margin: "0",
+        paddingLeft: "18px",
+        fontSize: "13px",
+        color: "#374151",
+        lineHeight: "1.6"
+      });
+
+      cardData.keyPoints.forEach((point) => {
+        const li = document.createElement("li");
+        li.textContent = point;
+        keyPointsList.appendChild(li);
+      });
+
+      card.appendChild(keyPointsTitle);
+      card.appendChild(keyPointsList);
+    }
 
     const sectionTitle = document.createElement("div");
     sectionTitle.textContent = "Branch conversation";
@@ -416,13 +494,13 @@
     });
 
     sendBtn.addEventListener("click", async () => {
-      await handleSendMessage(cardData.id, input, messagesContainer, sendBtn);
+      await handleSendMessage(cardData.id, input, sendBtn, card);
     });
 
     input.addEventListener("keydown", async (event) => {
       if (event.key === "Enter") {
         event.preventDefault();
-        await handleSendMessage(cardData.id, input, messagesContainer, sendBtn);
+        await handleSendMessage(cardData.id, input, sendBtn, card);
       }
     });
 
@@ -436,10 +514,6 @@
       color: "#6b7280"
     });
 
-    card.appendChild(cardHeader);
-    card.appendChild(label);
-    card.appendChild(selectedTextBox);
-    card.appendChild(introMessage);
     card.appendChild(sectionTitle);
     card.appendChild(messagesContainer);
     card.appendChild(inputWrapper);
@@ -460,20 +534,53 @@
     }
   }
 
-  async function createDummyCard(selectedText) {
+  async function createBranchCard(selectedText) {
     ensureSidebar();
 
-    const cardData = {
-      id: generateId(),
-      title: "New Branch Card",
+    const cardId = generateId();
+    const parentContext = extractParentContext();
+
+    const initialCard = {
+      id: cardId,
+      title: "Building context...",
       selectedText,
-      message: "Branch card ready. Ask a follow-up question.",
+      parentContext,
+      parentSummary: "Building branch context...",
+      keyPoints: [],
       messages: [],
       createdAt: Date.now()
     };
 
-    await addCardToStorage(cardData);
-    cardsContainer.prepend(createCardElement(cardData));
+    await addCardToStorage(initialCard);
+    cardsContainer.prepend(createCardElement(initialCard));
+
+    try {
+      const summaryData = await summarizeCardContext(selectedText, parentContext);
+
+      await updateCardInStorage(cardId, (card) => ({
+        ...card,
+        title: summaryData.title || "New Branch Card",
+        parentSummary: summaryData.summary || "",
+        keyPoints: summaryData.keyPoints || []
+      }));
+
+      const cardElement = document.querySelector(`[data-card-id="${cardId}"]`);
+      if (cardElement) {
+        await refreshCard(cardId, cardElement);
+      }
+    } catch (error) {
+      await updateCardInStorage(cardId, (card) => ({
+        ...card,
+        title: "Context Error",
+        parentSummary: `Could not build branch context: ${error.message}`,
+        keyPoints: []
+      }));
+
+      const cardElement = document.querySelector(`[data-card-id="${cardId}"]`);
+      if (cardElement) {
+        await refreshCard(cardId, cardElement);
+      }
+    }
   }
 
   function createExplainButton(x, y, selectedText) {
@@ -499,8 +606,8 @@
 
     explainButton.addEventListener("click", async (event) => {
       event.stopPropagation();
-      await createDummyCard(selectedText);
       removeExplainButton();
+      await createBranchCard(selectedText);
     });
 
     document.body.appendChild(explainButton);
@@ -551,5 +658,5 @@
 
   renderStoredCards();
 
-  console.log("AI Branch Cards Step 5 with Gemini loaded.");
+  console.log("AI Branch Cards Step 6 loaded.");
 })();

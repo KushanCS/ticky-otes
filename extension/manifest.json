@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "AI Branch Cards",
   "version": "1.0.0",
-  "description": "Show an Explain button and create branch cards on ChatGPT.",
+  "description": "Create context-aware branch cards on ChatGPT.",
   "permissions": ["storage"],
   "host_permissions": ["http://127.0.0.1:5000/*"],
   "content_scripts": [
