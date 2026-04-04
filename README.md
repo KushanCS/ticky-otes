@@ -47,8 +47,9 @@ Backend
 
 ⸻
 
-📂 Project Structure
+## 📂 Project Structure
 
+```bash
 project-root/
 │
 ├── extension/                # Chrome Extension
