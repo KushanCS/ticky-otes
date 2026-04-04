@@ -11,7 +11,18 @@
         "https://chatgpt.com/*",
         "https://*.chatgpt.com/*"
       ],
-      "js": ["content.js"]
+      "css": ["styles/glass.css"],
+      "js": [
+        "utils/constants.js",
+        "utils/helpers.js",
+        "utils/storage.js",
+        "utils/api.js",
+        "features/contextExtractor.js",
+        "features/sidebar.js",
+        "features/cards.js",
+        "features/selection.js",
+        "content.js"
+      ]
     }
   ]
 }
